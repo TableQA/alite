@@ -19,25 +19,27 @@ import time
 pd.options.mode.chained_assignment = None  # default='warn'
 
 
-def getColumnType(attribute, column_threshold=0.5, entity_threshold=0.5):
+def get_column_type(column, column_threshold=0.5, entity_threshold=0.5):
     """
-    This function takes a column and determines whether it is text or numeric column
-    This has been done using a well-known information retrieval technique
-    Check each cell to see if it is text.
-    Then if enough number of cells are text, the column is considered as a text column.
-    return 1 if text column, 0 if numeric column
+    Determines whether a column is text or numeric based on the majority of its cells.
+    Returns 1 if text column, 0 if numeric column.
     """
-    strAttribute = [item for item in attribute if type(item) == str]
-    strAtt = [item for item in strAttribute if not item.isdigit()]
-    for i in range(len(strAtt) - 1, -1, -1):
-        entity = strAtt[i]
-        num_count = 0
-        for char in entity:
-            if char.isdigit():
-                num_count += 1
-        if num_count / len(entity) > entity_threshold:
-            del strAtt[i]
-    if len(strAtt) / len(attribute) > column_threshold:
+    str_cells = []
+    for cell in column:
+        if isinstance(cell, str):
+            str_cells.append(cell)
+
+    text_cells = []
+    for cell in str_cells:
+        for char in cell:
+            if char in string.ascii_letters:
+                text_cells.append(cell)
+                break
+    num_text_cells = len(text_cells) / len(str_cells)
+
+    if num_text_cells > entity_threshold:
+        return 1
+    elif len(str_cells) / len(column) > column_threshold:
         return 1
     else:
         return 0
@@ -131,7 +133,7 @@ for tablename in all_files:
                     table_columns[column] = []
             for column in table_columns:
                 try:
-                    if getColumnType(real_table[column].tolist()) == 1:
+                    if get_column_type(real_table[column].tolist()) == 1:
                         # print("String column ", column)
                         all_columns.add(column)
                         total_columns += 1
