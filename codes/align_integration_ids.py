@@ -19,11 +19,14 @@ import time
 pd.options.mode.chained_assignment = None  # default='warn'
 
 
-# This function takes a column and determines whether it is text or numeric column
-# This has been done using a well-known information retrieval technique
-# Check each cell to see if it is text. Then if enough number of cells are
-# text, the column is considered as a text column.
 def getColumnType(attribute, column_threshold=0.5, entity_threshold=0.5):
+    """
+    This function takes a column and determines whether it is text or numeric column
+    This has been done using a well-known information retrieval technique
+    Check each cell to see if it is text.
+    Then if enough number of cells are text, the column is considered as a text column.
+    return 1 if text column, 0 if numeric column
+    """
     strAttribute = [item for item in attribute if type(item) == str]
     strAtt = [item for item in strAttribute if not item.isdigit()]
     for i in range(len(strAtt) - 1, -1, -1):
