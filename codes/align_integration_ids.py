@@ -1,3 +1,4 @@
+from pathlib import Path
 import os
 import math
 import glob
@@ -72,40 +73,34 @@ def findsubsets(s, n):
     return list(itertools.combinations(s, n))
 
 
-def main():
-    # Opening JSON file
-
-    method = (
-        r"bert/"  # change it to fasttext or turl for using the respective embeddings.
-    )
-    vec_length = 300
-    if method == "fasttext/" or method == "bert/":
+def main(
+    method="bert",  # fasttext or turl or bert
+    input_folder_name="Align Benchmark",  # Align Benchmark or Real Benchmark
+):
+    if method == "fasttext":
         table_index = 3
-        if method == "bert/":
-            vec_length = 768
-    else:
+        vec_length = 300
+    elif method == "bert":
+        table_index = 3
+        vec_length = 768
+    elif method == "turl":
         table_index = 2
         vec_length = 312
-    benchmark_selection = 0
-    while benchmark_selection != 1 and benchmark_selection != 2:
-        print("Which Benchmark? Press 1 for Align. Press 2 for Real")
-        benchmark_selection = int(input())
-    input_folder_name = r"Align Benchmark/"
-    if benchmark_selection == 2:
-        input_folder_name = r"Real Benchmark/"
-    foldername = method + input_folder_name
-    all_files = glob.glob(foldername + "*")
+    else:
+        raise Exception("Invalid method")
+
+    embedding_root = Path(method) / input_folder_name
+    embedding_paths = embedding_root.glob("**/*")
+
     final_precision = {}
     final_recall = {}
     final_f_measure = {}
     start_time = time.time_ns()
-    for tablename in all_files:
+    for embedding_path in embedding_paths:
         try:
-            tablename = tablename.rsplit(os.sep, 1)[-1]
-            filename = foldername + tablename
-
-            with open(filename) as f:
-                data = json.load(f)
+            tablename = embedding_path.name
+            with open(embedding_path) as f:
+                embedding = json.load(f)
 
             column_embeddings = []
             track_columns = {}  # for debugging only
@@ -118,8 +113,8 @@ def main():
             # change below to 3 for bert and fast text
             cluster_name = tablename.split("_", table_index)[-1]
             cluster_name = cluster_name.split(".", 1)[0]
-            real_table_path = input_folder_name + cluster_name + "/"
-            for table in data:
+            real_table_path = input_folder_name + "/" + cluster_name + "/"
+            for table in embedding:
                 try:
                     real_table = pd.read_csv(
                         real_table_path + table,
@@ -130,7 +125,7 @@ def main():
                 except:
                     # print("table not found")
                     break
-                table_columns = data[table]
+                table_columns = embedding[table]
                 if len(table_columns) == 0:
                     for column in list(real_table.columns):
                         table_columns[column] = []
@@ -305,9 +300,8 @@ def main():
             plt.show()
 
             # =============================================================================
-        except Exception as e:
+        except:
             continue
-            # print(e)
 
     end_time = time.time_ns()
     total_time = int(end_time - start_time) / 10**9
@@ -329,7 +323,7 @@ def main():
     average_recall = total_recall / len(final_recall)
     average_f_measure = total_f_measure / len(final_f_measure)
     print("-------------------------------------")
-    print("Result by:", method[:-1], " in ", input_folder_name[:-1])
+    print("Result by:", method, " in ", input_folder_name)
     print("Average precision:", average_precision)
     print("Average recall", average_recall)
     print("Average f measure", average_f_measure)
