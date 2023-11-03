@@ -1,21 +1,19 @@
-from pathlib import Path
-import os
-import math
-import glob
+import itertools
 import json
 import string
-import numpy as np
-from matplotlib import pyplot as plt
-from scipy.cluster.hierarchy import dendrogram
-from sklearn.datasets import load_iris
-from sklearn.cluster import AgglomerativeClustering
-from sklearn.cluster import KMeans
-from sklearn.neighbors import kneighbors_graph
-from scipy.sparse import csr_matrix
-import pandas as pd
-import itertools
-from sklearn import metrics
 import time
+from collections import defaultdict
+from itertools import combinations
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from matplotlib import pyplot as plt
+from pydantic import BaseModel
+from scipy.cluster.hierarchy import dendrogram
+from scipy.sparse import csr_matrix
+from sklearn import metrics
+from sklearn.cluster import AgglomerativeClustering
 
 pd.options.mode.chained_assignment = None  # default='warn'
 
@@ -69,266 +67,294 @@ def plot_dendrogram(model, **kwargs):
     dendrogram(linkage_matrix, **kwargs)
 
 
-def findsubsets(s, n):
-    return list(itertools.combinations(s, n))
+def get_col_link(cols_in_table, num_columns):
+    col_link_set = set()
+    for table_name in cols_in_table:
+        indices = cols_in_table[table_name]
+        for c in itertools.combinations(indices, 2):
+            col_link_set.add(c)
+
+    col_link_arr = np.zeros((num_columns, num_columns))
+    for i, j in combinations(range(num_columns), 2):
+        if (i, j) not in col_link_set and (j, i) not in col_link_set:
+            col_link_arr[i, j] = 1
+            col_link_arr[j, i] = 1
+    col_link_csr = csr_matrix(col_link_arr)
+
+    return col_link_csr
 
 
-def main(
-    method="bert",  # fasttext or turl or bert
-    input_folder_name="Align Benchmark",  # Align Benchmark or Real Benchmark
+def cluster(
+    n_clusters,
+    column_embeddings,
+    col_link_csr,
+    all_distance,
 ):
-    if method == "fasttext":
-        table_index = 3
-        vec_length = 300
-    elif method == "bert":
-        table_index = 3
-        vec_length = 768
-    elif method == "turl":
-        table_index = 2
-        vec_length = 312
-    else:
-        raise Exception("Invalid method")
+    clusters = AgglomerativeClustering(
+        n_clusters=n_clusters,
+        metric="l2",
+        compute_distances=True,
+        linkage="complete",
+        connectivity=col_link_csr,
+    )
+    clusters.fit_predict(column_embeddings)
+    labels = clusters.labels_  # .tolist()
+    all_distance[n_clusters] = metrics.silhouette_score(column_embeddings, labels)
 
-    embedding_root = Path(method) / input_folder_name
-    embedding_paths = embedding_root.glob("**/*")
+    result_dict = defaultdict(set)
+    for col_index, label in enumerate(labels.tolist()):
+        result_dict[label].add(col_index)
 
-    final_precision = {}
-    final_recall = {}
-    final_f_measure = {}
-    start_time = time.time_ns()
-    for embedding_path in embedding_paths:
-        try:
-            tablename = embedding_path.name
-            with open(embedding_path) as f:
-                embedding = json.load(f)
+    pred_edges = set()
+    for col_index_set in result_dict:
+        set1 = result_dict[col_index_set]
+        set2 = result_dict[col_index_set]
+        cur_pred_edges = set()
+        for s1 in set1:
+            for s2 in set2:
+                cur_pred_edges.add(tuple(sorted((s1, s2))))
+        pred_edges = pred_edges.union(cur_pred_edges)
 
-            column_embeddings = []
-            track_columns = {}  # for debugging only
-            track_tables = {}
-            record_same_cluster = {}
-            i = 0
-            count_tables = 0
-            all_columns = set()
-            total_columns = 0
-            # change below to 3 for bert and fast text
-            cluster_name = tablename.split("_", table_index)[-1]
-            cluster_name = cluster_name.split(".", 1)[0]
-            real_table_path = input_folder_name + "/" + cluster_name + "/"
-            for table in embedding:
+    return pred_edges
+
+
+def plot_distance(distance_dict, title, num_columns, min_k):
+    distance_list = distance_dict.items()
+    distance_list = sorted(distance_list)
+    x, y = zip(*distance_list)
+    algorithm_k = max(distance_dict, key=distance_dict.get)
+
+    overlapping = 1
+    plt.plot(x, y)
+    plt.title(title)
+    plt.xlabel("number of clusters")
+    plt.ylabel("silhouette score")
+    plt.axvline(
+        x=num_columns,
+        color="red",
+        linestyle="dashed",
+        label="groundtruth k",
+        alpha=overlapping,
+        lw=3,
+    )
+    plt.axvline(
+        x=algorithm_k,
+        linestyle="dotted",
+        color="green",
+        label="algorithm k",
+        alpha=overlapping,
+        lw=3,
+    )
+    plt.axvline(x=min_k, color="black", label="min k")
+    plt.show()
+
+
+class AlignIntegrationIds(BaseModel):
+    method: str = "bert"  # fasttext or turl or bert
+    benchmark: str = "Align Benchmark"  # Align Benchmark or Real Benchmark
+
+    table_index: int = 3
+    vec_length: int = 300
+    get_cluster_name: object = None
+
+    def __init__(self, **data):
+        super().__init__(**data)
+
+        if self.method == "fasttext":
+            self.table_index = 3
+            self.vec_length = 300
+        elif self.method == "bert":
+            self.table_index = 3
+            self.vec_length = 768
+        elif self.method == "turl":
+            self.table_index = 2
+            self.vec_length = 312
+
+        self.get_cluster_name = lambda x: x.stem.split("_", self.table_index)[-1]
+
+    def run(self):
+        embedding_root = Path(self.method) / self.benchmark
+
+        final_precision = {}
+        final_recall = {}
+        final_f_measure = {}
+
+        start_time = time.time_ns()
+        for embedding_path in embedding_root.iterdir():
+            try:
+                precision, recall, f_measure = self.run_one(embedding_path)
+
+                final_precision[embedding_path.stem] = precision
+                final_recall[embedding_path.stem] = recall
+                final_f_measure[embedding_path.stem] = f_measure
+
+            except:
+                continue
+        end_time = time.time_ns()
+        total_time = int(end_time - start_time) / 10**9
+
+        self.measure_summary(final_precision, final_recall, final_f_measure, total_time)
+
+    def measure_summary(
+        self,
+        precision,
+        recall,
+        f_measure,
+        total_time,
+    ):
+        total_precision = 0
+        total_recall = 0
+        total_f_measure = 0
+        average_precision = 0
+        average_recall = 0
+        average_f_measure = 0
+
+        for item in precision:
+            total_precision += precision[item]
+        for item in recall:
+            total_recall += recall[item]
+        for item in f_measure:
+            total_f_measure += f_measure[item]
+
+        average_precision = total_precision / len(precision)
+        average_recall = total_recall / len(recall)
+        average_f_measure = total_f_measure / len(f_measure)
+        print("-------------------------------------")
+        print("Result by:", self.method, " in ", self.benchmark)
+        print("Average precision:", average_precision)
+        print("Average recall", average_recall)
+        print("Average f measure", average_f_measure)
+        print("Total time", total_time)
+        print("-------------------------------------")
+
+    def run_one(self, embedding_path):
+        (
+            column_embeddings,
+            col_link_csr,
+            cols_in_table,
+            gt_edges,
+            col_name_set,
+        ) = self.load(embedding_path)
+
+        min_k = 1
+        max_k = 0
+        for item in cols_in_table:
+            if len(cols_in_table[item]) > min_k:
+                min_k = len(cols_in_table[item])
+            max_k += len(cols_in_table[item])
+
+        all_distance = {}
+        record_current_precision = {}
+        record_current_recall = {}
+        record_current_f_measure = {}
+        record_result_edges = {}
+        for col_id in range(min_k, max_k):
+            pred_edges = cluster(
+                col_id,
+                column_embeddings,
+                col_link_csr,
+                all_distance,
+            )
+
+            current_true_positive = len(gt_edges.intersection(pred_edges))
+            current_precision = current_true_positive / len(pred_edges)
+            current_recall = current_true_positive / len(gt_edges)
+
+            record_current_precision[col_id] = current_precision
+            record_current_recall[col_id] = current_recall
+            record_current_f_measure[col_id] = 0
+            if (current_precision + current_recall) > 0:
+                record_current_f_measure[col_id] = (
+                    2 * current_precision * current_recall
+                ) / (current_precision + current_recall)
+            record_result_edges[col_id] = pred_edges
+
+        algorithm_k = max(all_distance, key=all_distance.get)
+        precision = record_current_precision[algorithm_k]
+        recall = record_current_recall[algorithm_k]
+        f_measure = record_current_f_measure[algorithm_k]
+
+        plot_distance(all_distance, embedding_path.stem, len(col_name_set), min_k)
+
+        return precision, recall, f_measure
+
+    def load(self, embedding_path):
+        with open(embedding_path) as f:
+            embedding = json.load(f)
+
+        column_embeddings = []
+        col_id_dict = {}
+        cols_in_table = defaultdict(set)
+        cols_in_same_cluster = defaultdict(set)
+        col_id = 0
+        col_name_set = set()
+        cluster_name = self.get_cluster_name(embedding_path)
+        for table_name in embedding:
+            table_path = Path(self.benchmark) / cluster_name / table_name
+            if not table_path.exists():
+                continue
+
+            db_table = pd.read_csv(
+                table_path,
+                encoding="latin1",
+                warn_bad_lines=True,
+                error_bad_lines=False,
+            )
+
+            # fill empty columns with empty list
+            col_embedding_dict = embedding[table_name]
+            if len(col_embedding_dict) == 0:
+                for column in list(db_table.columns):
+                    col_embedding_dict[column] = []
+
+            for column in col_embedding_dict:
                 try:
-                    real_table = pd.read_csv(
-                        real_table_path + table,
-                        encoding="latin1",
-                        warn_bad_lines=True,
-                        error_bad_lines=False,
-                    )
+                    if get_column_type(db_table[column].tolist()) == 1:
+                        col_name_set.add(column)
+                        all_embeddings = col_embedding_dict[column]
+
+                        if self.method == "turl":
+                            entities_only = all_embeddings["entities_only"]
+                        elif self.method in ["fasttext", "bert"]:
+                            entities_only = all_embeddings
+                        else:
+                            raise Exception("Invalid method")
+
+                        if (
+                            isinstance(entities_only, float)
+                            or not entities_only
+                            or not all_embeddings
+                        ):
+                            entities_only = np.random.uniform(-1, 1, self.vec_length)
+                        column_embeddings.append(entities_only)
+
+                        col_id_dict[(table_name, column)] = col_id
+                        cols_in_table[table_name].add(col_id)
+                        cols_in_same_cluster[column].add(col_id)
+
+                        col_id += 1
                 except:
-                    # print("table not found")
-                    break
-                table_columns = embedding[table]
-                if len(table_columns) == 0:
-                    for column in list(real_table.columns):
-                        table_columns[column] = []
-                for column in table_columns:
-                    try:
-                        if get_column_type(real_table[column].tolist()) == 1:
-                            # print("String column ", column)
-                            all_columns.add(column)
-                            total_columns += 1
-                            all_embeddings = table_columns[column]
-                            if table_index == 2:
-                                entities_only = all_embeddings["entities_only"]
-                            else:
-                                # fast text and bert
-                                entities_only = all_embeddings
-                            if (
-                                isinstance(entities_only, float) == True
-                                or len(entities_only) == 0
-                                or len(all_embeddings) == 0
-                            ):
-                                entities_only = np.random.uniform(-1, 1, vec_length)
-                            column_embeddings.append(entities_only)
-                            track_columns[(table, column)] = i
-                            if table in track_tables:
-                                track_tables[table].add(i)
-                            else:
-                                track_tables[table] = {i}
+                    continue
+        num_columns = col_id
 
-                            if column not in record_same_cluster:
-                                record_same_cluster[column] = {i}
-                            else:
-                                record_same_cluster[column].add(i)
-                            i += 1
+        gt_edges = set()
+        for column in cols_in_same_cluster:
+            col_ids = cols_in_same_cluster[column]
+            cur_gt_edges = set(map(tuple, map(sorted, combinations(col_ids, 2))))
+            gt_edges = gt_edges.union(cur_gt_edges)
 
-                    except:
-                        continue
-                count_tables += 1
-            # =============================================================================
-            #             if count_tables > 10:
-            #                 break
-            # =============================================================================
+        column_embeddings = np.array(column_embeddings)
 
-            all_true_edges = set()
-            for col_index_set in record_same_cluster:
-                set1 = record_same_cluster[col_index_set]
-                set2 = record_same_cluster[col_index_set]
-                current_true_edges = set()
-                for s1 in set1:
-                    for s2 in set2:
-                        current_true_edges.add(tuple(sorted((s1, s2))))
-                all_true_edges = all_true_edges.union(current_true_edges)
+        col_link_csr = get_col_link(cols_in_table, num_columns)
 
-            # =============================================================================
-            #         relationship = open("track_col.csv", 'w', encoding='utf-8')
-            #         for i in track_columns.items():
-            #             relationship.write(str(i[0][0]) + "," + str(i[0][1]) + ','+ str(i[1]) + '\n')
-            #         relationship.close()
-            # =============================================================================
-            x = np.array(column_embeddings)
-            zero_positions = set()
-            for table in track_tables:
-                indices = track_tables[table]
-                all_combinations = findsubsets(indices, 2)
-                for each in all_combinations:
-                    zero_positions.add(each)
-
-            arr = np.zeros((len(track_columns), len(track_columns)))
-            for i in range(0, len(track_columns) - 1):
-                for j in range(i + 1, len(track_columns)):
-                    # print(i, j)
-                    if (
-                        (i, j) not in zero_positions
-                        and (j, i) not in zero_positions
-                        and i != j
-                    ):
-                        arr[i][j] = 1
-                        arr[j][i] = 1
-            # convert to sparse matrix representation
-            s = csr_matrix(arr)
-
-            all_distance = {}
-            all_labels = {}
-            record_current_precision = {}
-            record_current_recall = {}
-            record_current_f_measure = {}
-            min_k = 1
-            max_k = 0
-            record_result_edges = {}
-
-            for item in track_tables:
-                # print(item, len(track_tables[item]))
-                if len(track_tables[item]) > min_k:
-                    min_k = len(track_tables[item])
-                max_k += len(track_tables[item])
-
-            for i in range(min_k, min(max_k, max_k)):
-                # clusters = KMeans(n_clusters=14).fit(x)
-                clusters = AgglomerativeClustering(
-                    n_clusters=i,
-                    metric="l2",
-                    compute_distances=True,
-                    linkage="complete",
-                    connectivity=s,
-                )
-                clusters.fit_predict(x)
-                labels = clusters.labels_  # .tolist()
-                all_labels[i] = labels.tolist()
-                all_distance[i] = metrics.silhouette_score(x, labels)
-                result_dict = {}
-                wrong_results = set()
-                for col_index, label in enumerate(all_labels[i]):
-                    if label in result_dict:
-                        result_dict[label].add(col_index)
-                    else:
-                        result_dict[label] = {col_index}
-
-                all_result_edges = set()
-                for col_index_set in result_dict:
-                    set1 = result_dict[col_index_set]
-                    set2 = result_dict[col_index_set]
-                    current_result_edges = set()
-                    for s1 in set1:
-                        for s2 in set2:
-                            current_result_edges.add(tuple(sorted((s1, s2))))
-                    all_result_edges = all_result_edges.union(current_result_edges)
-
-                current_true_positive = len(
-                    all_true_edges.intersection(all_result_edges)
-                )
-                current_precision = current_true_positive / len(all_result_edges)
-                current_recall = current_true_positive / len(all_true_edges)
-
-                record_current_precision[i] = current_precision
-                record_current_recall[i] = current_recall
-                record_current_f_measure[i] = 0
-                if (current_precision + current_recall) > 0:
-                    record_current_f_measure[i] = (
-                        2 * current_precision * current_recall
-                    ) / (current_precision + current_recall)
-                record_result_edges[i] = all_result_edges
-            distance_list = all_distance.items()
-            distance_list = sorted(distance_list)
-            x, y = zip(*distance_list)
-            algorithm_k = max(all_distance, key=all_distance.get)
-            final_precision[tablename] = record_current_precision[algorithm_k]
-            final_recall[tablename] = record_current_recall[algorithm_k]
-            final_f_measure[tablename] = record_current_f_measure[algorithm_k]
-            overlapping = 1
-            plt.plot(x, y)
-            plt.title(tablename)
-            plt.xlabel("number of clusters")
-            plt.ylabel("silhouette score")
-            plt.axvline(
-                x=len(all_columns),
-                color="red",
-                linestyle="dashed",
-                label="groundtruth k",
-                alpha=overlapping,
-                lw=3,
-            )
-            plt.axvline(
-                x=algorithm_k,
-                linestyle="dotted",
-                color="green",
-                label="algorithm k",
-                alpha=overlapping,
-                lw=3,
-            )
-            plt.axvline(x=min_k, color="black", label="min k")
-            # plt.axvline(x = max_k, color = 'black', label = 'max k')
-            # plt.legend(bbox_to_anchor = (1.0, 1), loc = 'lower right', borderaxespad=3)
-            plt.show()
-
-            # =============================================================================
-        except:
-            continue
-
-    end_time = time.time_ns()
-    total_time = int(end_time - start_time) / 10**9
-    total_precision = 0
-    total_recall = 0
-    total_f_measure = 0
-    average_precision = 0
-    average_recall = 0
-    average_f_measure = 0
-
-    for item in final_precision:
-        total_precision += final_precision[item]
-    for item in final_recall:
-        total_recall += final_recall[item]
-    for item in final_f_measure:
-        total_f_measure += final_f_measure[item]
-
-    average_precision = total_precision / len(final_precision)
-    average_recall = total_recall / len(final_recall)
-    average_f_measure = total_f_measure / len(final_f_measure)
-    print("-------------------------------------")
-    print("Result by:", method, " in ", input_folder_name)
-    print("Average precision:", average_precision)
-    print("Average recall", average_recall)
-    print("Average f measure", average_f_measure)
-    print("Total time:", total_time)
+        return (
+            column_embeddings,
+            col_link_csr,
+            cols_in_table,
+            gt_edges,
+            col_name_set,
+        )
 
 
 if __name__ == "__main__":
-    main()
+    AlignIntegrationIds().run()
